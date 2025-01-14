@@ -1,15 +1,20 @@
 import ms from "ms";
+import { Action } from "./constants.js";
 import { db } from "./db.js";
-import { main, scanRssFeeds } from "./pipeline.js";
 import { exitOnCrossSeedErrors } from "./errors.js";
+import { injectSavedTorrents } from "./inject.js";
 import { Label, logger } from "./logger.js";
+import { main, scanRssFeeds } from "./pipeline.js";
 import { getRuntimeConfig } from "./runtimeConfig.js";
+import { updateCaps } from "./torznab.js";
+import { cleanupTorrentCache } from "./decide.js";
 
 class Job {
 	name: string;
 	cadence: number;
 	exec: () => Promise<void>;
 	isActive: boolean;
+
 	constructor(name, cadence, exec) {
 		this.name = name;
 		this.cadence = cadence;
@@ -35,18 +40,25 @@ class Job {
 	}
 }
 
-const getJobs = () => {
-	const { rssCadence, searchCadence } = getRuntimeConfig();
-	return [
-		rssCadence && new Job("rss", rssCadence, scanRssFeeds),
-		searchCadence && new Job("search", searchCadence, main),
-	].filter(Boolean);
-};
+function getJobs(): Job[] {
+	const { action, rssCadence, searchCadence, torznab } = getRuntimeConfig();
+	const jobs: Job[] = [];
+	if (rssCadence) jobs.push(new Job("rss", rssCadence, scanRssFeeds));
+	if (searchCadence) jobs.push(new Job("search", searchCadence, main));
+	if (torznab.length > 0) {
+		jobs.push(new Job("updateIndexerCaps", ms("1 day"), updateCaps));
+	}
+	if (action === Action.INJECT) {
+		jobs.push(new Job("inject", ms("1 hour"), injectSavedTorrents));
+	}
+	jobs.push(new Job("cleanup", ms("1 day"), cleanupTorrentCache));
+	return jobs;
+}
 
 function logNextRun(
 	name: string,
 	cadence: number,
-	lastRun: number | undefined | null
+	lastRun: number | undefined | null,
 ) {
 	const now = Date.now();
 

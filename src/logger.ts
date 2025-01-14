@@ -1,8 +1,9 @@
 import { join } from "path";
+import stripAnsi from "strip-ansi";
 import winston from "winston";
-import { appDir, createAppDir } from "./configuration.js";
-import { getRuntimeConfig } from "./runtimeConfig.js";
 import DailyRotateFile from "winston-daily-rotate-file";
+import { appDir, createAppDir } from "./configuration.js";
+import { getRuntimeConfig, RuntimeConfig } from "./runtimeConfig.js";
 
 export enum Label {
 	QBITTORRENT = "qbittorrent",
@@ -10,6 +11,7 @@ export enum Label {
 	TRANSMISSION = "transmission",
 	DELUGE = "deluge",
 	DECIDE = "decide",
+	INJECT = "inject",
 	PREFILTER = "prefilter",
 	CONFIGDUMP = "configdump",
 	TORZNAB = "torznab",
@@ -18,8 +20,12 @@ export enum Label {
 	SCHEDULER = "scheduler",
 	SEARCH = "search",
 	RSS = "rss",
+	ANNOUNCE = "announce",
+	WEBHOOK = "webhook",
 	PERF = "perf",
-	REVERSE_LOOKUP = "reverselookup",
+	ARRS = "arrs",
+	RADARR = "radarr",
+	SONARR = "sonarr",
 }
 
 export let logger: winston.Logger;
@@ -43,18 +49,28 @@ function redactUrlPassword(message, urlStr) {
 	return message;
 }
 
-function redactMessage(message: string | unknown) {
+function redactMessage(message: string | unknown, options?: RuntimeConfig) {
 	if (typeof message !== "string") {
 		return message;
 	}
-	const runtimeConfig = getRuntimeConfig();
+	const runtimeConfig = options ?? getRuntimeConfig();
 	let ret = message;
 
-	// redact torznab api keys
-	ret = ret.replace(/apikey=[a-zA-Z0-9]+/g, `apikey=${redactionMsg}`);
+	ret = ret.replace(/key=[a-zA-Z0-9]+/g, `key=${redactionMsg}`);
+	ret = ret.replace(/pass=[a-zA-Z0-9]+/g, `pass=${redactionMsg}`);
+	ret = ret.replace(
+		/(?:(?:auto|download)[./]\d+[./])([a-zA-Z0-9]+)/g,
+		(match, key) => match.replace(key, redactionMsg),
+	);
+	ret = ret.replace(
+		/(?:\d+[./](?:auto|download)[./])([a-zA-Z0-9]+)/g,
+		(match, key) => match.replace(key, redactionMsg),
+	);
+	ret = ret.replace(/apiKey: '.+'/g, `apiKey: ${redactionMsg}`);
+
 	ret = ret.replace(
 		/\/notification\/crossSeed\/[a-zA-Z-0-9_-]+/g,
-		`/notification/crossSeed/${redactionMsg}`
+		`/notification/crossSeed/${redactionMsg}`,
 	);
 	for (const [key, urlStr] of Object.entries(runtimeConfig)) {
 		if (key.endsWith("Url") && urlStr) {
@@ -64,15 +80,29 @@ function redactMessage(message: string | unknown) {
 	return ret;
 }
 
-const logOnceCache: string[] = [];
-export function logOnce(cacheKey: string, cb: () => void) {
-	if (!logOnceCache.includes(cacheKey)) {
-		logOnceCache.push(cacheKey);
+function stripAnsiChars(message: string | unknown) {
+	if (typeof message !== "string") {
+		return message;
+	}
+	return stripAnsi(message);
+}
+
+const logOnceCache: Set<string> = new Set();
+
+export function logOnce(cacheKey: string, cb: () => void, ttl?: number) {
+	if (!logOnceCache.has(cacheKey)) {
+		logOnceCache.add(cacheKey);
 		cb();
+
+		if (ttl) {
+			setTimeout(() => {
+				logOnceCache.delete(cacheKey);
+			}, ttl).unref();
+		}
 	}
 }
 
-export function initializeLogger(): void {
+export function initializeLogger(options: RuntimeConfig): void {
 	createAppDir();
 	logger = winston.createLogger({
 		level: "info",
@@ -82,12 +112,14 @@ export function initializeLogger(): void {
 			}),
 			winston.format.errors({ stack: true }),
 			winston.format.splat(),
-			winston.format.colorize(),
-			winston.format.printf(({ level, message, label, timestamp }) => {
-				return `${timestamp} ${level}: ${
-					label ? `[${label}] ` : ""
-				}${redactMessage(message)}`;
-			})
+			winston.format.printf(
+				({ level, message, label, timestamp, stack, cause }) => {
+					const msg = `${message}${stack ? `\n${stack}` : ""}${cause ? `\n${cause}` : ""}`;
+					return `${timestamp} ${level}: ${
+						label ? `[${label}] ` : ""
+					}${stripAnsiChars(redactMessage(msg, options))}`;
+				},
+			),
 		),
 		transports: [
 			new DailyRotateFile({
@@ -114,16 +146,26 @@ export function initializeLogger(): void {
 				level: "silly",
 			}),
 			new winston.transports.Console({
-				level: getRuntimeConfig().verbose ? "silly" : "info",
+				level: options.verbose ? "silly" : "info",
 				format: winston.format.combine(
 					winston.format.errors({ stack: true }),
 					winston.format.splat(),
 					winston.format.colorize(),
-					winston.format.printf(({ level, message, label }) => {
-						return `${level}: ${
-							label ? `[${label}] ` : ""
-						}${redactMessage(message)}`;
-					})
+					winston.format.printf(
+						({
+							level,
+							message,
+							label,
+							timestamp,
+							stack,
+							cause,
+						}) => {
+							const msg = `${message}${stack ? `\n${stack}` : ""}${cause ? `\n${cause}` : ""}`;
+							return `${timestamp} ${level}: ${
+								label ? `[${label}] ` : ""
+							}${redactMessage(msg, options)}`;
+						},
+					),
 				),
 			}),
 		],

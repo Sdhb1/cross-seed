@@ -1,16 +1,39 @@
-import { promises as fs, Stats } from "fs";
+import { readdirSync, type Stats } from "fs";
+import { stat, unlink, writeFile } from "fs/promises";
 import { dirname, join, resolve, sep } from "path";
 import { inspect } from "util";
 import xmlrpc, { Client } from "xmlrpc";
-import { InjectionResult } from "../constants.js";
+import {
+	DecisionAnyMatch,
+	InjectionResult,
+	TORRENT_TAG,
+} from "../constants.js";
 import { CrossSeedError } from "../errors.js";
 import { Label, logger } from "../logger.js";
 import { Metafile } from "../parseTorrent.js";
 import { Result, resultOf, resultOfErr } from "../Result.js";
 import { getRuntimeConfig } from "../runtimeConfig.js";
-import { File, Searchee } from "../searchee.js";
-import { extractCredentialsFromUrl, wait } from "../utils.js";
-import { TorrentClient } from "./TorrentClient.js";
+import { File, Searchee, SearcheeWithInfoHash } from "../searchee.js";
+import {
+	extractCredentialsFromUrl,
+	humanReadableSize,
+	isTruthy,
+	sanitizeInfoHash,
+	wait,
+} from "../utils.js";
+import {
+	TorrentMetadataInClient,
+	getMaxRemainingBytes,
+	getResumeStopTime,
+	resumeErrSleepTime,
+	resumeSleepTime,
+	shouldRecheck,
+	TorrentClient,
+	validateSavePaths,
+} from "./TorrentClient.js";
+import { loadTorrentDirLight } from "../torrent.js";
+
+const COULD_NOT_FIND_INFO_HASH = "Could not find info-hash.";
 
 interface LibTorrentResumeFileEntry {
 	completed: number;
@@ -33,73 +56,64 @@ interface DownloadLocation {
 	downloadDir: string;
 }
 
+type Fault = { faultCode: number; faultString: string };
+
 async function createLibTorrentResumeTree(
 	meta: Metafile,
-	basePath: string
+	basePath: string,
 ): Promise<LibTorrentResume> {
 	async function getFileResumeData(
-		file: File
-	): Promise<LibTorrentResumeFileEntry> {
+		file: File,
+	): Promise<LibTorrentResumeFileEntry | null> {
 		const filePathWithoutFirstSegment = file.path
 			.split(sep)
 			.slice(1)
 			.join(sep);
-
 		const resolvedFilePath = resolve(basePath, filePathWithoutFirstSegment);
-		const fileStat = await fs
-			.stat(resolvedFilePath)
-			.catch(() => ({ isFile: () => false } as Stats));
+		const fileStat = await stat(resolvedFilePath).catch(
+			() => ({ isFile: () => false }) as Stats,
+		);
 		if (!fileStat.isFile() || fileStat.size !== file.length) {
-			logger.debug({
-				label: Label.RTORRENT,
-				message: `File ${resolvedFilePath} either doesn't exist or is the wrong size.`,
-			});
-			return {
-				completed: 0,
-				mtime: 0,
-				priority: 0,
-			};
+			return null;
 		}
 
 		return {
 			completed: Math.ceil(file.length / meta.pieceLength),
 			mtime: Math.trunc(fileStat.mtimeMs / 1000),
-			priority: 0,
+			priority: 1,
 		};
 	}
 
+	const fileResumes = await Promise.all(meta.files.map(getFileResumeData));
 	return {
 		bitfield: Math.ceil(meta.length / meta.pieceLength),
-		files: await Promise.all<LibTorrentResumeFileEntry>(
-			meta.files.map(getFileResumeData)
-		),
+		files: fileResumes.filter(isTruthy),
 	};
 }
 
 async function saveWithLibTorrentResume(
 	meta: Metafile,
 	savePath: string,
-	basePath: string
+	basePath: string,
 ): Promise<void> {
 	const rawWithLibtorrentResume = {
 		...meta.raw,
 		libtorrent_resume: await createLibTorrentResumeTree(meta, basePath),
 	};
-	await fs.writeFile(
-		savePath,
-		new Metafile(rawWithLibtorrentResume).encode()
-	);
+	await writeFile(savePath, new Metafile(rawWithLibtorrentResume).encode());
 }
 
 export default class RTorrent implements TorrentClient {
 	client: Client;
+	readonly type = Label.RTORRENT;
+
 	constructor() {
 		const { rtorrentRpcUrl } = getRuntimeConfig();
 
 		const { href, username, password } = extractCredentialsFromUrl(
-			rtorrentRpcUrl
+			rtorrentRpcUrl!,
 		).unwrapOrThrow(
-			new CrossSeedError("rTorrent url must be percent-encoded")
+			new CrossSeedError("rTorrent url must be percent-encoded"),
 		);
 
 		const clientCreator =
@@ -136,72 +150,142 @@ export default class RTorrent implements TorrentClient {
 	async checkForInfoHashInClient(infoHash: string): Promise<boolean> {
 		const downloadList = await this.methodCallP<string[]>(
 			"download_list",
-			[]
+			[],
 		);
 		return downloadList.includes(infoHash.toUpperCase());
 	}
 
 	private async checkOriginalTorrent(
-		searchee: Searchee
+		infoHash: string,
+		onlyCompleted: boolean,
 	): Promise<
 		Result<
-			{ directoryBase: string },
-			InjectionResult.FAILURE | InjectionResult.TORRENT_NOT_COMPLETE
+			{
+				name: string;
+				directoryBase: string;
+				bytesLeft: number;
+				hashing: number;
+				isMultiFile: boolean;
+				isActive: boolean;
+			},
+			"FAILURE" | "TORRENT_NOT_COMPLETE" | "NOT_FOUND"
 		>
 	> {
-		const infoHash = searchee.infoHash.toUpperCase();
-		type ReturnType = [[string], ["0" | "1"]];
-		let result;
+		const hash = infoHash.toUpperCase();
+		type ReturnType =
+			| [
+					[string],
+					[string],
+					[number],
+					[number],
+					["0" | "1"],
+					["0" | "1"],
+					["0" | "1"],
+			  ]
+			| Fault[];
+
+		let response: ReturnType;
 		try {
-			result = await this.methodCallP<ReturnType>("system.multicall", [
+			response = await this.methodCallP<ReturnType>("system.multicall", [
 				[
 					{
+						methodName: "d.name",
+						params: [hash],
+					},
+					{
 						methodName: "d.directory",
-						params: [infoHash],
+						params: [hash],
+					},
+					{
+						methodName: "d.left_bytes",
+						params: [hash],
+					},
+					{
+						methodName: "d.hashing",
+						params: [hash],
 					},
 					{
 						methodName: "d.complete",
-						params: [infoHash],
+						params: [hash],
+					},
+					{
+						methodName: "d.is_multi_file",
+						params: [hash],
+					},
+					{
+						methodName: "d.is_active",
+						params: [hash],
 					},
 				],
 			]);
 		} catch (e) {
 			logger.debug(e);
-			return resultOfErr(InjectionResult.FAILURE);
+			return resultOfErr("FAILURE");
 		}
 
-		// temp diag for #154
+		function isFault(response: ReturnType): response is Fault[] {
+			return "faultString" in response[0];
+		}
+
 		try {
-			const [[directoryBase], [isCompleteStr]] = result;
-			const isComplete = Boolean(Number(isCompleteStr));
-			if (!isComplete) {
-				return resultOfErr(InjectionResult.TORRENT_NOT_COMPLETE);
+			if (isFault(response)) {
+				if (response[0].faultString === COULD_NOT_FIND_INFO_HASH) {
+					return resultOfErr("NOT_FOUND");
+				} else {
+					throw new Error(
+						"Unknown rTorrent fault while checking original torrent",
+					);
+				}
 			}
-			return resultOf({ directoryBase });
+			const [
+				[name],
+				[directoryBase],
+				[bytesLeft],
+				[hashing],
+				[isCompleteStr],
+				[isMultiFileStr],
+				[isActive],
+			] = response;
+			const isComplete = Boolean(Number(isCompleteStr));
+			if (onlyCompleted && !isComplete) {
+				return resultOfErr("TORRENT_NOT_COMPLETE");
+			}
+			return resultOf({
+				name,
+				directoryBase,
+				bytesLeft,
+				hashing,
+				isMultiFile: Boolean(Number(isMultiFileStr)),
+				isActive: Boolean(Number(isActive)),
+			});
 		} catch (e) {
 			logger.error(e);
 			logger.debug("Failure caused by server response below:");
-			logger.debug(inspect(result));
-			return resultOfErr(InjectionResult.FAILURE);
+			logger.debug(inspect(response));
+			return resultOfErr("FAILURE");
 		}
 	}
 
 	private async getDownloadLocation(
 		meta: Metafile,
 		searchee: Searchee,
-		path?: string
+		path?: string,
 	): Promise<
 		Result<
 			DownloadLocation,
-			InjectionResult.FAILURE | InjectionResult.TORRENT_NOT_COMPLETE
+			"NOT_FOUND" | "TORRENT_NOT_COMPLETE" | "FAILURE"
 		>
 	> {
 		if (path) {
-			const basePath = join(path, searchee.name);
+			// resolve to absolute because we send the path to rTorrent
+			const basePath = resolve(path, meta.name);
 			const directoryBase = meta.isSingleFileTorrent ? path : basePath;
 			return resultOf({ downloadDir: path, basePath, directoryBase });
 		} else {
-			const result = await this.checkOriginalTorrent(searchee);
+			const result = await this.checkOriginalTorrent(
+				searchee.infoHash!,
+				true,
+			);
 			return result.mapOk(({ directoryBase }) => ({
 				directoryBase,
 				downloadDir: meta.isSingleFileTorrent
@@ -215,24 +299,259 @@ export default class RTorrent implements TorrentClient {
 	}
 
 	async validateConfig(): Promise<void> {
-		const { rtorrentRpcUrl } = getRuntimeConfig();
-		// no validation to do
-		if (!rtorrentRpcUrl) return;
-
+		const { rtorrentRpcUrl, torrentDir } = getRuntimeConfig();
 		try {
 			await this.methodCallP<string[]>("download_list", []);
 		} catch (e) {
 			logger.debug(e);
 			throw new CrossSeedError(
-				`Failed to reach rTorrent at ${rtorrentRpcUrl}`
+				`Failed to reach rTorrent at ${rtorrentRpcUrl}`,
 			);
 		}
+
+		if (!torrentDir) return;
+		if (!readdirSync(torrentDir).some((f) => f.endsWith("_resume"))) {
+			throw new CrossSeedError(
+				"Invalid torrentDir, if no torrents are in client set to null for now: https://www.cross-seed.org/docs/basics/options#torrentdir",
+			);
+		}
+		const searcheesRes = loadTorrentDirLight(torrentDir);
+		const allTorrents = await this.getAllTorrents();
+		const infoHashPathMap = await this.getAllDownloadDirs({
+			metas: allTorrents.map((torrent) => torrent.infoHash),
+			onlyCompleted: false,
+		});
+		await validateSavePaths(infoHashPathMap, await searcheesRes);
+	}
+
+	async getDownloadDir(
+		meta: SearcheeWithInfoHash | Metafile,
+		options: { onlyCompleted: boolean },
+	): Promise<
+		Result<string, "NOT_FOUND" | "TORRENT_NOT_COMPLETE" | "UNKNOWN_ERROR">
+	> {
+		const result = await this.checkOriginalTorrent(
+			meta.infoHash,
+			options.onlyCompleted,
+		);
+		return result
+			.mapOk(({ directoryBase, isMultiFile }) => {
+				return isMultiFile ? dirname(directoryBase) : directoryBase;
+			})
+			.mapErr((error) => (error === "FAILURE" ? "UNKNOWN_ERROR" : error));
+	}
+
+	async getAllDownloadDirs(options: {
+		metas: SearcheeWithInfoHash[] | Metafile[] | string[];
+		onlyCompleted: boolean;
+	}): Promise<Map<string, string>> {
+		if (options.metas.length === 0) return new Map();
+		const infoHashes: string[] =
+			typeof options.metas[0] === "string"
+				? options.metas
+				: options.metas.map((meta) => meta.infoHash);
+		type ReturnType = string[][] | Fault[];
+		let response: ReturnType;
+		try {
+			response = await this.methodCallP<ReturnType>("system.multicall", [
+				infoHashes
+					.map((hash) => [
+						{
+							methodName: "d.directory",
+							params: [hash],
+						},
+						{
+							methodName: "d.is_multi_file",
+							params: [hash],
+						},
+					])
+					.flat(),
+			]);
+		} catch (e) {
+			logger.error({
+				Label: Label.RTORRENT,
+				message: "Failed to get download directories for all torrents",
+			});
+			logger.debug(e);
+			return new Map();
+		}
+
+		function isFault(response: ReturnType): response is Fault[] {
+			return "faultString" in response[0];
+		}
+
+		try {
+			if (isFault(response)) {
+				logger.error({
+					Label: Label.RTORRENT,
+					message:
+						"Fault while getting download directories for all torrents",
+				});
+				logger.debug(inspect(response));
+				return new Map();
+			}
+
+			return new Map(
+				infoHashes.map((hash, index) => {
+					const directory = response[index * 2][0];
+					const isMultiFile = Boolean(
+						Number(response[index * 2 + 1][0]),
+					);
+					return [hash, isMultiFile ? dirname(directory) : directory];
+				}),
+			);
+		} catch (e) {
+			logger.error({
+				Label: Label.RTORRENT,
+				message: "Error parsing response for all torrents",
+			});
+			logger.debug(e);
+			return new Map();
+		}
+	}
+
+	async isTorrentComplete(
+		infoHash: string,
+	): Promise<Result<boolean, "NOT_FOUND">> {
+		try {
+			const response = await this.methodCallP<string[]>("d.complete", [
+				infoHash,
+			]);
+			if (response.length === 0) {
+				return resultOfErr("NOT_FOUND");
+			}
+			return resultOf(response[0] === "1");
+		} catch (e) {
+			return resultOfErr("NOT_FOUND");
+		}
+	}
+
+	async getAllTorrents(): Promise<TorrentMetadataInClient[]> {
+		const infoHashes = await this.methodCallP<string[]>(
+			"download_list",
+			[],
+		);
+		type ReturnType = string[][] | Fault[];
+		let response: ReturnType;
+		try {
+			response = await this.methodCallP<ReturnType>("system.multicall", [
+				infoHashes.map((hash) => {
+					return {
+						methodName: "d.custom1",
+						params: [hash],
+					};
+				}),
+			]);
+		} catch (e) {
+			logger.error({
+				Label: Label.RTORRENT,
+				message: "Failed to get torrent info for all torrents",
+			});
+			logger.debug(e);
+			return [];
+		}
+
+		function isFault(response: ReturnType): response is Fault[] {
+			return "faultString" in response[0];
+		}
+		if (isFault(response)) {
+			logger.error({
+				Label: Label.RTORRENT,
+				message: "Fault while getting torrent info for all torrents",
+			});
+			logger.debug(inspect(response));
+			return [];
+		}
+
+		try {
+			// response: [ [tag1], [tag2], ... ], assuming infoHash order is preserved
+			return infoHashes.map((hash, index) => ({
+				infoHash: hash.toLowerCase(),
+				category: "",
+				tags:
+					(response[index] as string[]).length !== 1
+						? response[index]
+						: response[index][0].length
+							? decodeURIComponent(response[index][0])
+									.split(",")
+									.map((tag) => tag.trim())
+							: [],
+			})) as TorrentMetadataInClient[];
+		} catch (e) {
+			logger.error({
+				Label: Label.RTORRENT,
+				message: "Error parsing response for all torrents",
+			});
+			logger.debug(e);
+			return [];
+		}
+	}
+
+	async recheckTorrent(infoHash: string): Promise<void> {
+		// Pause first as it may resume after recheck automatically
+		await this.methodCallP<void>("d.pause", [infoHash]);
+		await this.methodCallP<void>("d.check_hash", [infoHash]);
+	}
+
+	async resumeInjection(
+		infoHash: string,
+		decision: DecisionAnyMatch,
+		options: { checkOnce: boolean },
+	): Promise<void> {
+		let sleepTime = resumeSleepTime;
+		const maxRemainingBytes = getMaxRemainingBytes(decision);
+		const stopTime = getResumeStopTime();
+		let stop = false;
+		while (Date.now() < stopTime) {
+			if (options.checkOnce) {
+				if (stop) return;
+				stop = true;
+			}
+			await wait(sleepTime);
+			const torrentInfoRes = await this.checkOriginalTorrent(
+				infoHash,
+				false,
+			);
+			if (torrentInfoRes.isErr()) {
+				sleepTime = resumeErrSleepTime; // Dropping connections or restart
+				continue;
+			}
+			const torrentInfo = torrentInfoRes.unwrap();
+			if (torrentInfo.hashing) {
+				continue;
+			}
+			const torrentLog = `${torrentInfo.name} [${sanitizeInfoHash(infoHash)}]`;
+			if (torrentInfo.isActive) {
+				logger.warn({
+					label: Label.RTORRENT,
+					message: `Will not resume torrent ${torrentLog}: active`,
+				});
+				return;
+			}
+			if (torrentInfo.bytesLeft > maxRemainingBytes) {
+				logger.warn({
+					label: Label.RTORRENT,
+					message: `Will not resume torrent ${torrentLog}: ${humanReadableSize(torrentInfo.bytesLeft, { binary: true })} remaining > ${humanReadableSize(maxRemainingBytes, { binary: true })}`,
+				});
+				return;
+			}
+			logger.info({
+				label: Label.RTORRENT,
+				message: `Resuming torrent ${torrentLog}`,
+			});
+			await this.methodCallP<void>("d.resume", [infoHash]);
+		}
+		logger.warn({
+			label: Label.RTORRENT,
+			message: `Will not resume torrent ${infoHash}: timeout`,
+		});
 	}
 
 	async inject(
 		meta: Metafile,
 		searchee: Searchee,
-		path?: string
+		decision: DecisionAnyMatch,
+		path?: string,
 	): Promise<InjectionResult> {
 		const { outputDir } = getRuntimeConfig();
 
@@ -241,39 +560,68 @@ export default class RTorrent implements TorrentClient {
 		}
 
 		const result = await this.getDownloadLocation(meta, searchee, path);
-		if (result.isErr()) return result.unwrapErrOrThrow();
-		const { directoryBase, basePath } = result.unwrapOrThrow();
+		if (result.isErr()) {
+			switch (result.unwrapErr()) {
+				case "NOT_FOUND":
+					return InjectionResult.FAILURE;
+				case "TORRENT_NOT_COMPLETE":
+					return InjectionResult.TORRENT_NOT_COMPLETE;
+				case "FAILURE":
+					return InjectionResult.FAILURE;
+			}
+		}
+		const { directoryBase, basePath } = result.unwrap();
 
 		const torrentFilePath = resolve(
 			outputDir,
-			`${meta.name}.tmp.${Date.now()}.torrent`
+			`${meta.name}.tmp.${Date.now()}.torrent`,
 		);
 
 		await saveWithLibTorrentResume(meta, torrentFilePath, basePath);
 
-		for (let i = 0; i < 5; i++) {
+		const toRecheck = shouldRecheck(searchee, decision);
+		const loadType = toRecheck ? "load.normal" : "load.start";
+
+		const retries = 5;
+		for (let i = 0; i < retries; i++) {
 			try {
-				await this.methodCallP<void>("load.start", [
-					"",
-					torrentFilePath,
-					`d.directory_base.set="${directoryBase}"`,
-					`d.custom1.set="cross-seed"`,
-					`d.custom.set=addtime,${Math.round(Date.now() / 1000)}`,
-				]);
+				await this.methodCallP<void>(
+					loadType,
+					[
+						"",
+						torrentFilePath,
+						`d.directory_base.set="${directoryBase}"`,
+						`d.custom1.set="${TORRENT_TAG}"`,
+						`d.custom.set=addtime,${Math.round(Date.now() / 1000)}`,
+						toRecheck
+							? `d.check_hash=${meta.infoHash.toUpperCase()}`
+							: null,
+					].filter((e) => e !== null),
+				);
+				if (toRecheck) {
+					this.resumeInjection(meta.infoHash, decision, {
+						checkOnce: false,
+					});
+				}
 				break;
 			} catch (e) {
+				logger.verbose({
+					label: Label.RTORRENT,
+					message: `Failed to inject torrent ${meta.name} on attempt ${i + 1}/${retries}`,
+				});
+				logger.debug(e);
 				await wait(1000 * Math.pow(2, i));
 			}
 		}
 
 		for (let i = 0; i < 5; i++) {
 			if (await this.checkForInfoHashInClient(meta.infoHash)) {
-				setTimeout(() => fs.unlink(torrentFilePath), 1000);
+				setTimeout(() => unlink(torrentFilePath), 1000);
 				return InjectionResult.SUCCESS;
 			}
 			await wait(100 * Math.pow(2, i));
 		}
-		setTimeout(() => fs.unlink(torrentFilePath), 1000);
+		setTimeout(() => unlink(torrentFilePath), 1000);
 		return InjectionResult.FAILURE;
 	}
 }

@@ -17,9 +17,15 @@ files to a folder you specify. After that, I recommend using
 [AutoTorrent2](https://github.com/JohnDoee/autotorrent2) to do the last-mile
 delivery into your client.
 
+## 🚨🚨🚨 Breaking changes in cross-seed v6 🚨🚨🚨
+
+Head on over to the
+[v6 migration guide](https://www.cross-seed.org/docs/v6-migration)
+to see the steps required for migration.
+ 
 ## Requirements
 
--   [Node 16+](https://nodejs.org/en/download)
+-   [Node >= 20](https://nodejs.org/en/download)
 -   Any number of indexers that support Torznab (use Jackett or Prowlarr to
     help)
 
